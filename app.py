@@ -33,6 +33,9 @@ def load_data():
     df["year"] = df["description"].str.extract(r"(\d{4})")[0]
     df["year"] = pd.to_numeric(df["year"], errors="coerce")
 
+    # Extract brand from model
+    df["brand"] = df["model"].str.split().str[0]
+
     # Car age
     df["car_age"] = 2026 - df["year"]
 
@@ -56,31 +59,53 @@ def load_data():
     for col in ["model", "gear_type", "location", "description"]:
         if col in df.columns:
             df[col] = df[col].fillna("Not available").replace("nan", "Not available")
-
+ 
+    # -------------------------------
+    # CLEAN INVALID MODEL NAMES
+    # -------------------------------
+    df["model"] = df["model"].astype(str)
+                    
+    price_pattern = r"(rm\s?\d+|\d+\s*/\s*month|\d+\s*month)"
+                    
+    df = df[~df["model"].str.lower().str.contains(price_pattern, regex=True)]
+    df = df[df["model"].str.contains("[A-Za-z]", regex=True)]
+                    
     return df
 
 # -------------------------------
 # Train Model
 # -------------------------------
-@st.cache_resource
 def train_model(df):
-    le_model = LabelEncoder()
-    le_gear = LabelEncoder()
+    model_price_mean = df.groupby("model")["list_price"].mean()
+    gear_price_mean = df.groupby("gear_type")["list_price"].mean()
+    le_brand = LabelEncoder()
 
     df_model = df.copy()
-    df_model["model_encoded"] = le_model.fit_transform(df_model["model"].astype(str))
-    df_model["gear_encoded"] = le_gear.fit_transform(df_model["gear_type"].astype(str))
 
-    X = df_model[["year", "milleage", "car_age", "model_encoded", "gear_encoded"]]
+    df_model["model_encoded"] = df_model["model"].map(model_price_mean)
+    df_model["gear_encoded"] = df_model["gear_type"].map(gear_price_mean)
+    df_model["brand_encoded"] = le_brand.fit_transform(df_model["brand"].astype(str))
+
+
+    X = df_model[["year", "milleage", "car_age", "brand_encoded", "model_encoded", "gear_encoded"]]
     y = df_model["list_price"]
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    model = RandomForestRegressor(n_estimators=100, random_state=42, max_depth=15)
+    model = RandomForestRegressor(
+        n_estimators=300,
+        max_depth=25,
+        min_samples_split=5,
+        min_samples_leaf=3,
+        max_features="sqrt",
+        random_state=42,
+        n_jobs=-1
+    )
+
     model.fit(X_train, y_train)
 
     score = model.score(X_test, y_test)
-    return model, le_model, le_gear, score
+    return model, model_price_mean, gear_price_mean, score
 
 # -------------------------------
 # Main App
@@ -88,7 +113,7 @@ def train_model(df):
 df = load_data()
 
 if df is not None and len(df) > 0:
-    model, le_model, le_gear, score = train_model(df)
+    model, model_price_mean, gear_price_mean, score = train_model(df)
 
     if model is not None:
         st.sidebar.success(f"Model trained! R² Score: {score:.3f}")
@@ -151,8 +176,8 @@ if df is not None and len(df) > 0:
                             encoder.classes_ = np.append(encoder.classes_, value)
                             return encoder.transform([value])[0]  
                     
-                    model_encoded = safe_encode(le_model, selected_model)
-                    gear_encoded = safe_encode(le_gear, gear_type)
+                    model_encoded = model_price_mean.get(selected_model, model_price_mean.mean())
+                    gear_encoded= gear_price_mean.get(gear_type, gear_price_mean.mean())
                     
                     input_data = pd.DataFrame({
                         "year": [year],
@@ -207,7 +232,7 @@ if df is not None and len(df) > 0:
                         filtered["price_score"] * 0.3 +
                         filtered["mileage_score"] * 0.4 +
                         filtered["age_score"] * 0.3
-                    ) * 100
+                        ) * 100
 
                     top_cars = filtered.nlargest(10, "match_score")
 
@@ -221,3 +246,6 @@ if df is not None and len(df) > 0:
                             col3.write(f"**Gear:** {car['gear_type']}")
                             col1.write(f"**Year:** {int(car['year'])}")
                             col2.write(f"**Model:** {car['model']}")
+
+
+
