@@ -24,7 +24,8 @@ def load_data():
         df = pd.read_csv("malaysia_used_cars.csv", 
                          on_bad_lines='skip',
                          quoting=1,    # QUOTE_ALL
-                         encoding='utf-8')
+                         encoding='utf-8'
+                        )
 
     # Clean column names
     df.columns = df.columns.str.strip().str.replace(" ", "_").str.lower()
@@ -79,14 +80,16 @@ def train_model(df):
     model_price_mean = df.groupby("model")["list_price"].mean()
     gear_price_mean = df.groupby("gear_type")["list_price"].mean()
     le_brand = LabelEncoder()
-
+ 
     df_model = df.copy()
-
+ 
     df_model["model_encoded"] = df_model["model"].map(model_price_mean)
     df_model["gear_encoded"] = df_model["gear_type"].map(gear_price_mean)
     df_model["brand_encoded"] = le_brand.fit_transform(df_model["brand"].astype(str))
-
-
+    
+    # sanity check to ensure encoder wasn't overwritten by a Series
+    assert hasattr(le_brand, "transform"), "le_brand must be an encoder, not a pandas Series"
+ 
     X = df_model[["year", "milleage", "car_age", "brand_encoded", "model_encoded", "gear_encoded"]]
     y = df_model["list_price"]
 
@@ -100,12 +103,12 @@ def train_model(df):
         max_features="sqrt",
         random_state=42,
         n_jobs=-1
-    )
+        )
 
     model.fit(X_train, y_train)
 
     score = model.score(X_test, y_test)
-    return model, model_price_mean, gear_price_mean, score
+    return model, model_price_mean, gear_price_mean, le_brand, score
 
 # -------------------------------
 # Main App
@@ -113,10 +116,10 @@ def train_model(df):
 df = load_data()
 
 if df is not None and len(df) > 0:
-    model, model_price_mean, gear_price_mean, score = train_model(df)
+    model, model_price_mean, gear_price_mean, le_brand, score = train_model(df)
 
     if model is not None:
-        st.sidebar.success(f"Model trained! R² Score: {score:.3f}")
+        st.sidebar.success(f"Model trained! | Random Forest | R² Score: {score:.3f}")
 
         page = st.sidebar.radio("Navigation", ["Overview", "Price Prediction", "Recommendations"])
 
@@ -163,6 +166,7 @@ if df is not None and len(df) > 0:
             
             with col2:
                 gear_type = st.selectbox("Gear Type", sorted(df["gear_type"].unique()))
+                brand = str(selected_model).split()[0] if selected_model else "Unknown"
             
             if st.button("Predict Price", type="primary"):
                 try:
@@ -176,6 +180,8 @@ if df is not None and len(df) > 0:
                             encoder.classes_ = np.append(encoder.classes_, value)
                             return encoder.transform([value])[0]  
                     
+                    brand_encoded = safe_encode(le_brand, brand)
+                    
                     model_encoded = model_price_mean.get(selected_model, model_price_mean.mean())
                     gear_encoded= gear_price_mean.get(gear_type, gear_price_mean.mean())
                     
@@ -183,6 +189,7 @@ if df is not None and len(df) > 0:
                         "year": [year],
                         "milleage": [mileage],
                         "car_age": [car_age],
+                        "brand_encoded": [brand_encoded],
                         "model_encoded": [model_encoded],
                         "gear_encoded": [gear_encoded],
                     })
@@ -224,6 +231,8 @@ if df is not None and len(df) > 0:
                 if len(filtered) == 0:
                     st.warning("No cars found. Try adjusting your filters.")
                 else:
+                    st.success(f"Found {len(filtered)} cars. Showing top 10 recommendations:")
+                    
                     # Match scoring
                     filtered["price_score"] = 1 - (filtered["list_price"] - budget_min) / max(1, (budget_max - budget_min))
                     filtered["mileage_score"] = 1 - (filtered["milleage"] / max_mileage)
@@ -232,20 +241,19 @@ if df is not None and len(df) > 0:
                         filtered["price_score"] * 0.3 +
                         filtered["mileage_score"] * 0.4 +
                         filtered["age_score"] * 0.3
-                        ) * 100
+                    ) * 100
 
                     top_cars = filtered.nlargest(10, "match_score")
 
-                    st.success(f"Found {len(filtered)} cars. Showing top 10 recommendations:")
-
                     for idx, car in top_cars.iterrows():
-                        with st.expander(f"**{car['description']}** - RM {car['list_price']:,.0f} | Match: {car['match_score']:.0f}%"):
-                            col1, col2, col3 = st.columns(3)
-                            col1.write(f"**Location:** {car['location']}")
-                            col2.write(f"**Mileage:** {car['milleage']:,.0f} km")
-                            col3.write(f"**Gear:** {car['gear_type']}")
-                            col1.write(f"**Year:** {int(car['year'])}")
-                            col2.write(f"**Model:** {car['model']}")
-
-
+                        with st.container():
+                            col1, col2, col3 = st.columns([2, 1, 1])
+                            with col1:
+                                st.write(f"**{car['model']}** ({int(car['year'])})")
+                                st.write(f"Mileage: {car['milleage']:,.0f} km | Gear: {car['gear_type']}")
+                            with col2:
+                                st.metric("Price", f"RM {car['list_price']:,.0f}")
+                            with col3:
+                                st.metric("Match Score", f"{car['match_score']:.1f}%")
+                            st.divider()
 
