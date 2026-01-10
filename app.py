@@ -256,4 +256,3 @@ if df is not None and len(df) > 0:
                             with col3:
                                 st.metric("Match Score", f"{car['match_score']:.1f}%")
                             st.divider()
-
