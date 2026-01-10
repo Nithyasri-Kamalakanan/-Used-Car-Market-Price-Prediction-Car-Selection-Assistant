@@ -3,7 +3,17 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# optional: try to import LightGBM, otherwise fallback to sklearn only
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except Exception:
+    HAS_LGB = False
 
 # -------------------------------
 # Page Config
@@ -73,42 +83,101 @@ def load_data():
                     
     return df
 
+
+def smooth_target_encoding(series, target, m=5):
+    # series: pd.Series of categorical values
+    # target: pd.Series numeric target (not log-transformed)
+    agg = target.groupby(series).agg(["mean", "count"]).rename(columns={"mean": "mean", "count": "count"})
+    global_mean = target.mean()
+    smooth = (agg["count"] * agg["mean"] + m * global_mean) / (agg["count"] + m)
+    return series.map(smooth).fillna(global_mean)
+
 # -------------------------------
 # Train Model
 # -------------------------------
-def train_model(df):
-    model_price_mean = df.groupby("model")["list_price"].mean()
-    gear_price_mean = df.groupby("gear_type")["list_price"].mean()
-    le_brand = LabelEncoder()
- 
+def train_model(df, do_cv=True):
+    # Prepare features with smoothing encodings and label encoder for brand
     df_model = df.copy()
- 
-    df_model["model_encoded"] = df_model["model"].map(model_price_mean)
-    df_model["gear_encoded"] = df_model["gear_type"].map(gear_price_mean)
-    df_model["brand_encoded"] = le_brand.fit_transform(df_model["brand"].astype(str))
-    
-    # sanity check to ensure encoder wasn't overwritten by a Series
-    assert hasattr(le_brand, "transform"), "le_brand must be an encoder, not a pandas Series"
- 
-    X = df_model[["year", "milleage", "car_age", "brand_encoded", "model_encoded", "gear_encoded"]]
-    y = df_model["list_price"]
 
+    # smooth encodings based on original price (not log) to preserve scale
+    df_model["model_encoded"] = smooth_target_encoding(df_model["model"], df_model["list_price"], m=8)
+    df_model["gear_encoded"] = smooth_target_encoding(df_model["gear_type"], df_model["list_price"], m=8)
+
+    le_brand = LabelEncoder()
+    df_model["brand_encoded"] = le_brand.fit_transform(df_model["brand"].astype(str))
+
+    # target: log1p transform to reduce skew
+    y = np.log1p(df_model["list_price"])
+
+    X = df_model[["year", "milleage", "car_age", "brand_encoded", "model_encoded", "gear_encoded"]]
+
+    # small train-test split for final evaluation
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    model = RandomForestRegressor(
-        n_estimators=300,
-        max_depth=25,
-        min_samples_split=5,
-        min_samples_leaf=3,
-        max_features="sqrt",
-        random_state=42,
-        n_jobs=-1
-        )
+    # Candidate models: RandomForest and LightGBM (if available)
+    rf = RandomForestRegressor(random_state=42, n_jobs=-1)
+    models = {}
+    models["rf"] = rf
+    if HAS_LGB:
+        lgbm = lgb.LGBMRegressor(random_state=42)
+        models["lgbm"] = lgbm
 
-    model.fit(X_train, y_train)
+    best_models = {}
 
-    score = model.score(X_test, y_test)
-    return model, model_price_mean, gear_price_mean, le_brand, score
+    # Quick randomized search spaces
+    rf_params = {
+        "n_estimators": [100, 200, 400],
+        "max_depth": [10, 20, 30, None],
+        "min_samples_leaf": [1, 2, 4],
+        "max_features": ["sqrt", "log2"]
+    }
+
+    lgb_params = {
+        "n_estimators": [100, 300, 600],
+        "num_leaves": [31, 50, 100],
+        "learning_rate": [0.01, 0.05, 0.1],
+        "max_depth": [-1, 10, 20]
+    }
+
+    # Fit and tune each candidate with small RandomizedSearchCV
+    for name, mdl in models.items():
+        if name == "rf":
+            rs = RandomizedSearchCV(mdl, rf_params, n_iter=8, cv=3, scoring="r2", n_jobs=-1, random_state=42)
+        else:
+            rs = RandomizedSearchCV(mdl, lgb_params, n_iter=8, cv=3, scoring="r2", n_jobs=-1, random_state=42)
+
+        rs.fit(X_train, y_train)
+        best_models[name] = rs.best_estimator_
+
+    # Evaluate with 5-fold CV on training set for each best model
+    cv_scores = {}
+    for name, mdl in best_models.items():
+        scores = cross_val_score(mdl, X_train, y_train, cv=5, scoring="r2", n_jobs=-1)
+        cv_scores[name] = np.mean(scores)
+
+    # pick best by CV score
+    # use items() to avoid typing issues with key= on some linters
+    best_name = max(cv_scores.items(), key=lambda kv: kv[1])[0]
+    best_model = best_models[best_name]
+
+    # fit best_model on full train set
+    best_model.fit(X_train, y_train)
+
+    # Evaluate on holdout test (log-target R2)
+    test_r2_log = best_model.score(X_test, y_test)
+
+    # return a dict of helpers and model
+    artifacts = {
+        "model": best_model,
+        "le_brand": le_brand,
+        "model_encoding_map": df_model.set_index("model")["model_encoded"].to_dict(),
+        "gear_encoding_map": df_model.set_index("gear_type")["gear_encoded"].to_dict(),
+        "cv_scores": cv_scores,
+        "chosen": best_name,
+        "test_r2_log": test_r2_log
+    }
+
+    return artifacts
 
 # -------------------------------
 # Main App
@@ -116,10 +185,21 @@ def train_model(df):
 df = load_data()
 
 if df is not None and len(df) > 0:
-    model, model_price_mean, gear_price_mean, le_brand, score = train_model(df)
+    artifacts = train_model(df)
+    model = artifacts["model"]
+    le_brand = artifacts["le_brand"]
+    model_price_mean = artifacts["model_encoding_map"]
+    gear_price_mean = artifacts["gear_encoding_map"]
+    score = artifacts.get("test_r2_log", None)
 
     if model is not None:
-        st.sidebar.success(f"Model trained! | Random Forest | R² Score: {score:.3f}")
+        chosen = artifacts.get("chosen", "random forest")
+        cv_scores = artifacts.get("cv_scores", {})
+        st.sidebar.success(f"Model trained! | {chosen.upper()} | test R² (log-target): {score:.3f}")
+        if cv_scores:
+            st.sidebar.write("CV R² (training):")
+            for k, v in cv_scores.items():
+                st.sidebar.write(f" - {k}: {v:.3f}")
 
         page = st.sidebar.radio("Navigation", ["Overview", "Price Prediction", "Recommendations"])
 
@@ -181,9 +261,15 @@ if df is not None and len(df) > 0:
                             return encoder.transform([value])[0]  
                     
                     brand_encoded = safe_encode(le_brand, brand)
-                    
-                    model_encoded = model_price_mean.get(selected_model, model_price_mean.mean())
-                    gear_encoded= gear_price_mean.get(gear_type, gear_price_mean.mean())
+
+                    def _dict_mean(d):
+                        try:
+                            return np.mean(list(d.values()))
+                        except Exception:
+                            return 0.0
+
+                    model_encoded = model_price_mean.get(selected_model, _dict_mean(model_price_mean))
+                    gear_encoded = gear_price_mean.get(gear_type, _dict_mean(gear_price_mean))
                     
                     input_data = pd.DataFrame({
                         "year": [year],
@@ -194,8 +280,10 @@ if df is not None and len(df) > 0:
                         "gear_encoded": [gear_encoded],
                     })
                     
-                    predicted_price = model.predict(input_data)[0]
-                    
+                    # model predicts log1p(target), invert with expm1
+                    predicted_log = model.predict(input_data)[0]
+                    predicted_price = np.expm1(predicted_log)
+
                     st.success("Prediction Complete!")
                     st.metric("Predicted Price", f"RM {predicted_price:,.0f}")
                 
