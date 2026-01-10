@@ -1,4 +1,4 @@
-streamlitstreamlit
+streamlit
 pandas
 numpy
 scikit-learn
@@ -8,3 +8,4 @@ xgboost
 catboost
 optuna
 category_encoders
+joblib
