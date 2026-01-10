@@ -3,3 +3,8 @@ pandas
 numpy
 scikit-learn
 matplotlib
+lightgbm
+xgboost
+catboost
+optuna
+category_encoders
