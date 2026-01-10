@@ -5,6 +5,8 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV
 import warnings
+import os
+import joblib
 
 warnings.filterwarnings("ignore")
 
@@ -185,18 +187,35 @@ def train_model(df, do_cv=True, retrain: bool = False):
 # -------------------------------
 df = load_data()
 
+# Path where trained artifacts will be persisted
+MODEL_PATH = "model_artifacts.joblib"
+
+def save_artifacts(artifacts, path=MODEL_PATH):
+    try:
+        joblib.dump(artifacts, path)
+    except Exception:
+        pass
+
+def load_artifacts(path=MODEL_PATH):
+    return joblib.load(path)
+
+
 if df is not None and len(df) > 0:
-    # allow manual retrain: clear cached resource and retrain only when user requests it
-    if st.sidebar.button("Retrain model (slow)"):
-        st.sidebar.info("Clearing cache and retraining — this may take some time...")
+    retrain_pressed = st.sidebar.button("Retrain model (slow)")
+
+    # If a saved model exists and retrain not requested, load from disk (fast)
+    if os.path.exists(MODEL_PATH) and not retrain_pressed:
         try:
-            st.cache_resource.clear()
+            artifacts = load_artifacts(MODEL_PATH)
+            st.sidebar.info("Loaded trained model from disk.")
         except Exception:
-            # older Streamlit versions may not have clear(); ignore
-            pass
-        artifacts = train_model(df, retrain=True)
+            artifacts = train_model(df)
+            save_artifacts(artifacts)
     else:
+        if retrain_pressed:
+            st.sidebar.info("Retraining and saving model — this may take some time...")
         artifacts = train_model(df)
+        save_artifacts(artifacts)
 
     model = artifacts["model"]
     le_brand = artifacts["le_brand"]
@@ -205,9 +224,9 @@ if df is not None and len(df) > 0:
     score = artifacts.get("test_r2_log", None)
 
     if model is not None:
-        chosen = artifacts.get("chosen", "random forest")
+        chosen = artifacts.get("chosen", "rf")
         cv_scores = artifacts.get("cv_scores", {})
-        st.sidebar.success(f"Model trained! | {chosen.upper()} | test R² (log-target): {score:.3f}")
+        st.sidebar.success(f"Model ready | {chosen.upper()} | test R² (log-target): {score:.3f}")
         if cv_scores:
             st.sidebar.write("CV R² (training):")
             for k, v in cv_scores.items():
