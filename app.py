@@ -95,7 +95,8 @@ def smooth_target_encoding(series, target, m=5):
 # -------------------------------
 # Train Model
 # -------------------------------
-def train_model(df, do_cv=True):
+@st.cache_resource
+def train_model(df, do_cv=True, retrain: bool = False):
     # Prepare features with smoothing encodings and label encoder for brand
     df_model = df.copy()
 
@@ -142,9 +143,9 @@ def train_model(df, do_cv=True):
     # Fit and tune each candidate with small RandomizedSearchCV
     for name, mdl in models.items():
         if name == "rf":
-            rs = RandomizedSearchCV(mdl, rf_params, n_iter=8, cv=3, scoring="r2", n_jobs=-1, random_state=42)
+            rs = RandomizedSearchCV(mdl, rf_params, n_iter=2, cv=2, scoring="r2", n_jobs=1, random_state=42)
         else:
-            rs = RandomizedSearchCV(mdl, lgb_params, n_iter=8, cv=3, scoring="r2", n_jobs=-1, random_state=42)
+            rs = RandomizedSearchCV(mdl, lgb_params, n_iter=2, cv=2, scoring="r2", n_jobs=1, random_state=42)
 
         rs.fit(X_train, y_train)
         best_models[name] = rs.best_estimator_
@@ -152,7 +153,7 @@ def train_model(df, do_cv=True):
     # Evaluate with 5-fold CV on training set for each best model
     cv_scores = {}
     for name, mdl in best_models.items():
-        scores = cross_val_score(mdl, X_train, y_train, cv=5, scoring="r2", n_jobs=-1)
+        scores = cross_val_score(mdl, X_train, y_train, cv=3, scoring="r2", n_jobs=1)
         cv_scores[name] = np.mean(scores)
 
     # pick best by CV score
@@ -185,7 +186,18 @@ def train_model(df, do_cv=True):
 df = load_data()
 
 if df is not None and len(df) > 0:
-    artifacts = train_model(df)
+    # allow manual retrain: clear cached resource and retrain only when user requests it
+    if st.sidebar.button("Retrain model (slow)"):
+        st.sidebar.info("Clearing cache and retraining — this may take some time...")
+        try:
+            st.cache_resource.clear()
+        except Exception:
+            # older Streamlit versions may not have clear(); ignore
+            pass
+        artifacts = train_model(df, retrain=True)
+    else:
+        artifacts = train_model(df)
+
     model = artifacts["model"]
     le_brand = artifacts["le_brand"]
     model_price_mean = artifacts["model_encoding_map"]
